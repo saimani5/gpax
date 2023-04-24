@@ -73,7 +73,7 @@ class viDKL(ExactGP):
             raise NotImplementedError("Select guide between 'delta' and 'normal'")
         nn_module = nn if nn else MLP
         self.nn_module = hk.transform(lambda x: nn_module(z_dim)(x))
-        self.kernel_dim = z_dim
+        self.kernel_dim = z_dim+1
         self.data_dim = (input_dim,) if isinstance(input_dim, int) else input_dim
         self.latent_prior = latent_prior
         self.guide_type = AutoNormal if guide == 'normal' else AutoDelta
@@ -81,12 +81,18 @@ class viDKL(ExactGP):
         self.nn_params = None
 
     def model(self, X: jnp.ndarray, y: jnp.ndarray = None, **kwargs) -> None:
-        """DKL probabilistic model"""
+        """DKL probabilistic model
+        X will now have an extra column,
+        This last column corresponds to the value that will get concatenated with z
+        """
         # NN part
         feature_extractor = random_haiku_module(
             "feature_extractor", self.nn_module, input_shape=(1, *self.data_dim),
             prior=(lambda name, shape: dist.Cauchy() if name.startswith("b") else dist.Normal()))
-        z = feature_extractor(X)
+        # We use all the columns except for the last one in the feature extractor
+        z = feature_extractor(X[...,:-1])
+        # Concatenating the last column of X to z
+        z = jnp.concatenate([z, X[...,:-1][:, None]], axis=1)
         if self.latent_prior:  # Sample latent variable
             z = self.latent_prior(z)
         # Sample GP kernel parameters
@@ -196,9 +202,13 @@ class viDKL(ExactGP):
         noise_p = noise * (1 - jnp.array(noiseless, int))
         # embed data into the latent space
         z_train = self.nn_module.apply(
-            nn_params, jax.random.PRNGKey(0), X_train)
+            nn_params, jax.random.PRNGKey(0), X_train[..., :-1])
         z_test = self.nn_module.apply(
-            nn_params, jax.random.PRNGKey(0), X_new)
+            nn_params, jax.random.PRNGKey(0), X_new[..., :-1])
+        
+        # Concatenate the last column of the X to z
+        z_train = jnp.concatenate([z_train, X_train[...,-1][:, None]], axis = 1)
+        z_test = jnp.concatenate([z_test, X_new[...,-1][:, None]], axis = 1)
         # compute kernel matrices for train and test data
         k_pp = get_kernel(self.kernel)(z_test, z_test, k_params, noise_p, **kwargs)
         k_pX = get_kernel(self.kernel)(z_test, z_train, k_params, jitter=0.0)
@@ -341,9 +351,9 @@ class viDKL(ExactGP):
             return self.nn_module.apply(nnpar_i, jax.random.PRNGKey(0), x_i)
 
         if self.X_train.ndim == len(self.data_dim) + 2:
-            z = jax.vmap(single_embed)(self.nn_params, X_new)
+            z = jax.vmap(single_embed)(self.nn_params, X_new[..., :-1])
         else:
-            z = single_embed(self.nn_params, X_new)
+            z = single_embed(self.nn_params, X_new[...,:-1])
         return z
 
     def _print_summary(self) -> None:
